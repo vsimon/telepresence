@@ -142,8 +142,8 @@ var localhostIPv6 = []net.IP{{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}}
 var localhostIPv4 = []net.IP{{127, 0, 0, 1}}
 
 func (o *outbound) resolveInCluster(c context.Context, qType uint16, query string) []net.IP {
-	query = query[:len(query)-1]
-	query = strings.ToLower(query) // strip of trailing dot
+	query = query[:len(query)-1] // strip of trailing dot
+	query = strings.ToLower(query)
 	query = strings.TrimSuffix(query, dotTel2SubDomain)
 
 	if query == "localhost" {
