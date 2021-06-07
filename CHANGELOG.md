@@ -1,5 +1,8 @@
 # Changelog
 
+### 2.3.1 (TBD)
+- Feature: The helm chart is now published as part of our CI.
+
 ### 2.3.0 (June 1, 2021)
 
 - Feature: Telepresence is now installable via brew
