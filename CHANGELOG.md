@@ -2,6 +2,7 @@
 
 ### 2.3.1 (TBD)
 
+- Feature: Agents can now be installed using a mutator webhook
 - Bugfix: Fix a bug where sometimes large transfers from services on the cluster would hang indefinitely
 
 ### 2.3.0 (June 1, 2021)

@@ -110,7 +110,10 @@ func agentEnvironment(agentName string, appContainer *kates.Container, appPort i
 func agentVolumeMounts(mounts []corev1.VolumeMount) []corev1.VolumeMount {
 	agentMounts := make([]corev1.VolumeMount, len(mounts)+1)
 	for i, mount := range mounts {
-		mount.MountPath = filepath.Join(TelAppMountPoint, mount.MountPath)
+		// Keep the ServiceAccount mount unaltered or a new one will be generated
+		if mount.MountPath != "/var/run/secrets/kubernetes.io/serviceaccount" {
+			mount.MountPath = filepath.Join(TelAppMountPoint, mount.MountPath)
+		}
 		agentMounts[i] = mount
 	}
 	agentMounts[len(mounts)] = corev1.VolumeMount{
@@ -131,4 +134,22 @@ func appEnvironment(appContainer *kates.Container) []corev1.EnvVar {
 		Value: appContainer.Name,
 	}
 	return envCopy
+}
+
+const maxPortNameLen = 15
+
+// HiddenPortName prefixes the given name with "tm-" and truncates it to 15 characters. If
+// the ordinal is greater than zero, the last two digits are reserved for the hexadecimal
+// representation of that ordinal.
+func HiddenPortName(name string, ordinal int) string {
+	// New name must be max 15 characters long
+	hiddenName := "tm-" + name
+	if len(hiddenName) > maxPortNameLen {
+		if ordinal > 0 {
+			hiddenName = hiddenName[:maxPortNameLen-2] + strconv.FormatInt(int64(ordinal), 16) // we don't expect more than 256 ports
+		} else {
+			hiddenName = hiddenName[:maxPortNameLen]
+		}
+	}
+	return hiddenName
 }

@@ -75,6 +75,14 @@ func (ki *installer) createManagerSvc(c context.Context) (*kates.Service, error)
 						StrVal: "api",
 					},
 				},
+				{
+					Name: "https",
+					Port: 443,
+					TargetPort: kates.IntOrString{
+						Type:   intstr.String,
+						StrVal: "https",
+					},
+				},
 			},
 		},
 	}
@@ -348,6 +356,17 @@ func (ki *installer) ensureAgent(c context.Context, namespace, name, svcName, po
 	if err != nil {
 		return "", "", err
 	}
+
+	var svc *kates.Service
+	if a := podTemplate.ObjectMeta.Annotations; a != nil && a[install.InjectAnnotation] == "enabled" {
+		// agent is injected using a mutating webhook. Get its service and skip the rest
+		svc, err = install.FindMatchingService(c, ki.client, portNameOrNumber, svcName, namespace, podTemplate.Labels)
+		if err != nil {
+			return "", "", err
+		}
+		return string(svc.GetUID()), kind, nil
+	}
+
 	var agentContainer *kates.Container
 	for i := range podTemplate.Spec.Containers {
 		container := &podTemplate.Spec.Containers[i]
@@ -365,40 +384,16 @@ telepresence uninstall --agent %s This will cancel any intercepts that
 already exist for this service`, kind, obj.GetName())
 		return "", "", errors.Wrap(err, msg)
 	}
-	var svc *kates.Service
 
 	switch {
 	case agentContainer == nil:
 		dlog.Infof(c, "no agent found for %s %s.%s", kind, name, namespace)
 		dlog.Infof(c, "Using port name or number %q", portNameOrNumber)
-		matchingSvcs, err := install.FindMatchingServices(c, ki.client, portNameOrNumber, svcName, namespace, podTemplate.Labels)
+		matchingSvc, err := install.FindMatchingService(c, ki.client, portNameOrNumber, svcName, namespace, podTemplate.Labels)
 		if err != nil {
 			return "", "", err
 		}
-
-		switch numSvcs := len(matchingSvcs); {
-		case numSvcs == 0:
-			errMsg := fmt.Sprintf("Found no services with a selector matching labels %v", podTemplate.Labels)
-			if portNameOrNumber != "" {
-				errMsg += fmt.Sprintf(" and a port referenced by name or port number %s", portNameOrNumber)
-			}
-			return "", "", errors.New(errMsg)
-		case numSvcs > 1:
-			svcNames := make([]string, 0, numSvcs)
-			for _, svc := range matchingSvcs {
-				svcNames = append(svcNames, svc.Name)
-			}
-
-			errMsg := fmt.Sprintf("Found multiple services with a selector matching labels %v in namespace %s, use --service and one of: %s",
-				podTemplate.Labels, namespace, strings.Join(svcNames, ","))
-			if portNameOrNumber != "" {
-				errMsg += fmt.Sprintf(" and a port referenced by name or port number %s", portNameOrNumber)
-			}
-			return "", "", errors.New(errMsg)
-		default:
-		}
-
-		obj, svc, err = addAgentToWorkload(c, portNameOrNumber, agentImageName, obj, matchingSvcs[0])
+		obj, svc, err = addAgentToWorkload(c, portNameOrNumber, agentImageName, obj, matchingSvc)
 		if err != nil {
 			return "", "", err
 		}
@@ -705,13 +700,15 @@ func addAgentToWorkload(
 	*kates.Service,
 	error,
 ) {
-	_, err := install.GetPodTemplateFromObject(object)
+	podTemplate, err := install.GetPodTemplateFromObject(object)
 	if err != nil {
 		return nil, nil, err
 	}
-	servicePort, container, containerPortIndex, err := install.FindMatchingPort(object, portNameOrNumber, matchingService)
+
+	cns := podTemplate.Spec.Containers
+	servicePort, container, containerPortIndex, err := install.FindMatchingPort(cns, portNameOrNumber, matchingService)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, install.ObjErrorf(object, err.Error())
 	}
 	if matchingService.Spec.ClusterIP == "None" {
 		dlog.Debugf(c,
@@ -868,41 +865,65 @@ func addAgentToWorkload(
 func (ki *installer) managerDeployment(c context.Context, env client.Env, addLicense bool) *kates.Deployment {
 	replicas := int32(1)
 
-	var containerEnv []corev1.EnvVar
-
-	containerEnv = append(containerEnv, corev1.EnvVar{Name: "LOG_LEVEL", Value: "info"})
-	if env.SystemAHost != "" {
-		containerEnv = append(containerEnv, corev1.EnvVar{Name: "SYSTEMA_HOST", Value: env.SystemAHost})
-	}
-	if env.SystemAPort != "" {
-		containerEnv = append(containerEnv, corev1.EnvVar{Name: "SYSTEMA_PORT", Value: env.SystemAPort})
-	}
 	clusterID := ki.getClusterId(c)
-	containerEnv = append(containerEnv, corev1.EnvVar{Name: "CLUSTER_ID", Value: clusterID})
+	var containerEnv = []corev1.EnvVar{
+		{Name: "LOG_LEVEL", Value: "info"},
+		{Name: "SYSTEMA_HOST", Value: env.SystemAHost},
+		{Name: "SYSTEMA_PORT", Value: env.SystemAPort},
+		{Name: "CLUSTER_ID", Value: clusterID},
+		{Name: "TELEPRESENCE_REGISTRY", Value: env.Registry},
+
+		// Manager needs to know its own namespace so that it can propagate that when
+		// to agents when injecting them
+		{
+			Name: "MANAGER_NAMESPACE",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "metadata.namespace",
+				},
+			},
+		},
+	}
+	if env.AgentImage != "" {
+		containerEnv = append(containerEnv, corev1.EnvVar{Name: "TELEPRESENCE_AGENT_IMAGE", Value: env.AgentImage})
+	}
+
 	// If addLicense is true, we mount the secret as a volume into the traffic-manager
 	// and then we mount that volume to a path in the container that the traffic-manager
 	// knows about and can read from.
-	var licenseVolume []corev1.Volume
-	var licenseVolumeMount []corev1.VolumeMount
+	var volumes []corev1.Volume
+	var volumeMounts []corev1.VolumeMount
 	if addLicense {
-		licenseVolume = []corev1.Volume{
-			{
-				Name: "license",
-				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{
-						SecretName: managerLicenseName,
-					},
+		volumes = append(volumes, corev1.Volume{
+			Name: "license",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: managerLicenseName,
 				},
 			},
-		}
-		licenseVolumeMount = []corev1.VolumeMount{
-			{
-				Name:      "license",
-				ReadOnly:  true,
-				MountPath: "/home/telepresence/",
-			},
-		}
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      "license",
+			ReadOnly:  true,
+			MountPath: "/home/telepresence/",
+		})
 	}
+
+	optional := true
+	volumes = append(volumes, corev1.Volume{
+		Name: "tls",
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: install.AgentInjectorTLSName,
+				Optional:   &optional,
+			},
+		},
+	})
+	volumeMounts = append(volumeMounts, corev1.VolumeMount{
+		Name:      "tls",
+		ReadOnly:  true,
+		MountPath: "/var/run/secrets/tls",
+	})
 
 	return &kates.Deployment{
 		TypeMeta: kates.TypeMeta{
@@ -933,10 +954,14 @@ func (ki *installer) managerDeployment(c context.Context, env client.Env, addLic
 									Name:          "api",
 									ContainerPort: install.ManagerPortHTTP,
 								},
+								{
+									Name:          "https",
+									ContainerPort: install.ManagerPortHTTPS,
+								},
 							},
-							VolumeMounts: licenseVolumeMount,
+							VolumeMounts: volumeMounts,
 						}},
-					Volumes:       licenseVolume,
+					Volumes:       volumes,
 					RestartPolicy: corev1.RestartPolicyAlways,
 				},
 			},
