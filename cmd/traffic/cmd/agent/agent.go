@@ -16,6 +16,7 @@ import (
 	"github.com/datawire/dlib/dlog"
 	rpc "github.com/telepresenceio/telepresence/rpc/v2/manager"
 	"github.com/telepresenceio/telepresence/v2/pkg/dpipe"
+	"github.com/telepresenceio/telepresence/v2/pkg/forwarder"
 	"github.com/telepresenceio/telepresence/v2/pkg/iputil"
 	"github.com/telepresenceio/telepresence/v2/pkg/version"
 )
@@ -204,7 +205,7 @@ func Main(ctx context.Context, args ...string) error {
 		dlog.Info(ctx, "Not starting sftp-server ($APP_MOUNTS is empty or $USER is set)")
 	}
 
-	forwarderChan := make(chan *Forwarder)
+	forwarderChan := make(chan *forwarder.Forwarder)
 
 	// Manage the forwarder
 	g.Go("forward", func(ctx context.Context) error {
@@ -214,7 +215,7 @@ func Main(ctx context.Context, args ...string) error {
 			return err
 		}
 
-		forwarder := NewForwarder(lisAddr, "", config.AppPort)
+		forwarder := forwarder.NewForwarder(lisAddr, "", config.AppPort)
 		forwarderChan <- forwarder
 
 		return forwarder.Serve(ctx)

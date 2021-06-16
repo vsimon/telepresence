@@ -1,5 +1,9 @@
 # Changelog
 
+### 2.3.3 (TBD)
+
+- Feature: `telepresence intercept` now supports a `--to-pod` flag that can be used to port-forward sidecars' ports from an intercepted pod
+
 ### 2.3.2 (TBD)
 
 - Bug: On a MacOS, files generated under /etc/resolver as the result of using include-suffixes in the cluster config, are now properly removed on quit.
