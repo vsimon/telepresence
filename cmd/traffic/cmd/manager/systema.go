@@ -14,6 +14,7 @@ import (
 	"github.com/datawire/dlib/dgroup"
 	"github.com/datawire/dlib/dlog"
 	systemarpc "github.com/telepresenceio/telepresence/rpc/v2/systema"
+	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/managerutil"
 	"github.com/telepresenceio/telepresence/v2/pkg/systema"
 )
 
@@ -32,11 +33,19 @@ func (c *systemaCredentials) GetRequestMetadata(ctx context.Context, _ ...string
 	} else {
 		// Uhh... pick one arbitrarily.  This case should be limited to the
 		// ReverseConnection call, since that call doesn't belong to any one user action.
+		// This can also happen if RemoveIntercept + RemoveDomain is called when a user
+		// quits a session and the manager reaps intercepts + the domain itself.
 		for _, client := range c.mgr.state.GetAllClients() {
 			if client.ApiKey != "" {
 				apikey = client.ApiKey
 				break
 			}
+		}
+
+		// If there were no other clients using telepresence, we try to find an APIKey
+		// used for creating an intercept.
+		if apikey == "" {
+			apikey = c.mgr.state.GetInterceptAPIKey()
 		}
 	}
 	if apikey == "" {
@@ -101,8 +110,9 @@ func (p *systemaPool) Get() (systemarpc.SystemACRUDClient, error) {
 	defer p.mu.Unlock()
 
 	if p.ctx == nil {
-		host := p.mgr.env.SystemAHost
-		port := p.mgr.env.SystemAPort
+		env := managerutil.GetEnv(p.mgr.ctx)
+		host := env.SystemAHost
+		port := env.SystemAPort
 
 		ctx, cancel := context.WithCancel(dgroup.WithGoroutineName(p.mgr.ctx, "/systema"))
 		client, wait, err := systema.ConnectToSystemA(

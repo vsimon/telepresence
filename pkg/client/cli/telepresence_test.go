@@ -20,6 +20,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/suite"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/datawire/ambassador/pkg/dtest"
 	"github.com/datawire/dlib/dexec"
@@ -257,6 +260,60 @@ func (ts *telepresenceSuite) TestA_WithNoDaemonRunning() {
 		}
 		ts.True(hasDebug, "daemon.log does not contain expected debug statements")
 	})
+
+	ts.Run("DNS includes", func() {
+		t := ts.T()
+		require := ts.Require()
+
+		tmpDir := t.TempDir()
+		origKubeconfigFileName := os.Getenv("DTEST_KUBECONFIG")
+		kubeconfigFileName := filepath.Join(tmpDir, "kubeconfig")
+		configFileName := filepath.Join(tmpDir, "config.yml")
+
+		var cfg *api.Config
+		cfg, err := clientcmd.LoadFromFile(origKubeconfigFileName)
+		require.NoError(err, "Unable to read DTEST_KUBECONFIG")
+		require.NoError(err, api.MinifyConfig(cfg), "unable to minify config")
+		var cluster *api.Cluster
+		for _, c := range cfg.Clusters {
+			cluster = c
+			break
+		}
+		require.NotNilf(cluster, "unable to get cluster from config")
+		cluster.Extensions = map[string]runtime.Object{"telepresence.io": &runtime.Unknown{
+			Raw: []byte(`{"dns":{"include-suffixes": [".org"]}}`),
+		}}
+
+		require.NoError(clientcmd.WriteToFile(*cfg, kubeconfigFileName), "unable to write modified kubeconfig")
+
+		configFile, err := os.Create(configFileName)
+		require.NoError(err)
+		_, err = configFile.WriteString("logLevels:\n  rootDaemon: debug\n")
+		require.NoError(err)
+		configFile.Close()
+
+		defer os.Setenv("KUBECONFIG", origKubeconfigFileName)
+		os.Setenv("KUBECONFIG", kubeconfigFileName)
+		ctx := dlog.NewTestContext(t, false)
+		ctx = filelocation.WithAppUserConfigDir(ctx, tmpDir)
+		ctx = filelocation.WithAppUserLogDir(ctx, tmpDir)
+		_, stderr := telepresenceContext(ctx, "connect")
+		require.Empty(stderr)
+		_ = run(ctx, "curl", "--silent", "example.org")
+
+		_, stderr = telepresenceContext(ctx, "quit")
+		require.Empty(stderr)
+		rootLog, err := os.Open(filepath.Join(tmpDir, "daemon.log"))
+		require.NoError(err)
+		defer rootLog.Close()
+
+		hasLookup := false
+		scn := bufio.NewScanner(rootLog)
+		for scn.Scan() && !hasLookup {
+			hasLookup = strings.Contains(scn.Text(), `LookupHost "example.org"`)
+		}
+		ts.True(hasLookup, "daemon.log does not contain expected LookupHost statement")
+	})
 }
 
 func (ts *telepresenceSuite) TestB_Connected() {
@@ -277,6 +334,9 @@ func (ts *telepresenceSuite) TestC_Uninstall() {
 		stdout, err := names()
 		require.NoError(err)
 		require.Equal(2, len(strings.Split(stdout, " "))) // The service and the deployment
+
+		// The telepresence-test-developer will not be able to uninstall everything
+		require.NoError(run(ctx, "kubectl", "config", "use-context", "default"))
 		stdout, stderr := telepresence(ts.T(), "uninstall", "--everything")
 		require.Empty(stderr)
 		require.Contains(stdout, "Daemon quitting")
@@ -554,6 +614,37 @@ func (cs *connectedSuite) TestL_LegacySwapDeploymentDoesIntercept() {
 	stdout, stderr := telepresence(cs.T(), "list", "--namespace", cs.ns(), "--intercepts")
 	require.Empty(stderr)
 	require.Contains(stdout, "No Workloads (Deployments, StatefulSets, or ReplicaSets)")
+}
+
+func (cs *connectedSuite) TestM_AutoInjectedAgent() {
+	ctx := dlog.NewTestContext(cs.T(), false)
+	cs.NoError(cs.tpSuite.applyApp(ctx, "echo-auto-inject", "echo-auto-inject", 80))
+	defer func() {
+		cs.NoError(cs.tpSuite.kubectl(ctx, "delete", "svc,deploy", "echo-auto-inject", "--context", "default"))
+	}()
+
+	cs.Run("shows up with agent installed in list output", func() {
+		cs.Eventually(func() bool {
+			stdout, stderr := telepresence(cs.T(), "list", "--namespace", cs.ns(), "--agents")
+			cs.Empty(stderr)
+			return strings.Contains(stdout, "echo-auto-inject: ready to intercept (traffic-agent already installed)")
+		},
+			10*time.Second, // waitFor
+			2*time.Second,  // polling interval
+		)
+	})
+
+	cs.Run("can be intercepted", func() {
+		defer telepresence(cs.T(), "leave", "echo-auto-inject-"+cs.ns())
+
+		require := cs.Require()
+		stdout, stderr := telepresence(cs.T(), "intercept", "--namespace", cs.ns(), "--mount", "false", "echo-auto-inject", "--port", "9091")
+		require.Empty(stderr)
+		require.Contains(stdout, "Using Deployment echo-auto-inject")
+		stdout, stderr = telepresence(cs.T(), "list", "--namespace", cs.ns(), "--intercepts")
+		require.Empty(stderr)
+		require.Contains(stdout, "echo-auto-inject: intercepted")
+	})
 }
 
 func (cs *connectedSuite) TestZ_Uninstall() {
